@@ -1,0 +1,22 @@
+# Runtime logs and telemetry data
+logs/
+*.log
+
+# Compiled binaries and test artifacts
+/server
+/go-llm-honeypot
+bin/
+dist/
+*.exe
+*.test
+*.out
+
+# Environment variables and local secrets
+.env
+.env.*
+
+# macOS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
