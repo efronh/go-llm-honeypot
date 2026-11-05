@@ -17,12 +17,14 @@ const maxRequestBody = 1 << 20
 type Handler struct {
 	detector *detection.Detector
 	logger   *logger.Logger
+	limiter  *RateLimiter
 }
 
 func NewHandler(detector *detection.Detector, requestLogger *logger.Logger) *Handler {
 	return &Handler{
 		detector: detector,
 		logger:   requestLogger,
+		limiter:  NewRateLimiter(defaultRateLimit, defaultRateWindow),
 	}
 }
 
@@ -43,6 +45,10 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.limiter.Allow(clientIP(r.RemoteAddr)) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)

@@ -132,3 +132,40 @@ func TestChatCompletionsEndpoint(t *testing.T) {
 		})
 	}
 }
+
+func TestRateLimiting(t *testing.T) {
+	mux := newTestMux(t)
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}`
+
+	// Send defaultRateLimit requests from the same IP (with different source ports)
+	for i := 0; i < defaultRateLimit; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		req.RemoteAddr = "192.0.2.10:5000"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("request %d: status = %d, want %d", i+1, rec.Code, http.StatusOK)
+		}
+	}
+
+	// Next request from the same IP (even with a different port) must be blocked with 429
+	blockedReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	blockedReq.RemoteAddr = "192.0.2.10:5001"
+	blockedRec := httptest.NewRecorder()
+	mux.ServeHTTP(blockedRec, blockedReq)
+
+	if blockedRec.Code != http.StatusTooManyRequests {
+		t.Fatalf("blocked request: status = %d, want %d", blockedRec.Code, http.StatusTooManyRequests)
+	}
+
+	// Request from a different IP must still succeed
+	otherIPReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	otherIPReq.RemoteAddr = "192.0.2.99:5000"
+	otherIPRec := httptest.NewRecorder()
+	mux.ServeHTTP(otherIPRec, otherIPReq)
+
+	if otherIPRec.Code != http.StatusOK {
+		t.Fatalf("other IP request: status = %d, want %d", otherIPRec.Code, http.StatusOK)
+	}
+}
