@@ -1,0 +1,53 @@
+[Unit]
+Description=Go LLM API Honeypot Service
+After=network.target
+
+[Service]
+Type=simple
+User=honeypot
+Group=honeypot
+WorkingDirectory=/opt/go-llm-honeypot
+ExecStart=/opt/go-llm-honeypot/server
+
+# Environment configuration
+Environment="HOST=127.0.0.1"
+Environment="PORT=8080"
+Environment="LOG_FILE=/var/log/go-llm-honeypot/honeypot.log"
+Environment="HMAC_KEY_FILE=/etc/go-llm-honeypot/hmac.key"
+
+Restart=on-failure
+RestartSec=5s
+
+# Process & Privilege Hardening
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+# Filesystem Sandboxing
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/log/go-llm-honeypot
+ReadOnlyPaths=/etc/go-llm-honeypot
+
+# Kernel & System Protection
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictNamespaces=true
+
+# Capability & Network Restrictions
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# Resource Limits
+LimitNOFILE=4096
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target
