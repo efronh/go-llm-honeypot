@@ -14,6 +14,7 @@ Environment="HOST=127.0.0.1"
 Environment="PORT=8080"
 Environment="LOG_FILE=/var/log/go-llm-honeypot/honeypot.log"
 Environment="HMAC_KEY_FILE=/etc/go-llm-honeypot/hmac.key"
+Environment="REQUIRE_HMAC_KEY=true"
 
 Restart=on-failure
 RestartSec=5s

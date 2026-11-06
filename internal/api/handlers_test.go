@@ -334,3 +334,27 @@ func TestEndToEndPipelineAndReportConsistency(t *testing.T) {
 		t.Errorf("ByCategory[system_prompt_extraction] = %d, want 1", summary.ByCategory[detection.CategorySystemPromptExtraction])
 	}
 }
+
+func TestHandlerReturns500WhenLoggerFails(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "honeypot.log")
+	reqLogger, err := logger.New(logPath)
+	if err != nil {
+		t.Fatalf("initialize logger: %v", err)
+	}
+	// Close logger before request to simulate disk/write failure
+	_ = reqLogger.Close()
+
+	mux := http.NewServeMux()
+	NewHandler(detection.NewDetector(), reqLogger).RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+		`{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}`,
+	))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d when logger fails", rec.Code, http.StatusInternalServerError)
+	}
+}

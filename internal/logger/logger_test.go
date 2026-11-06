@@ -111,6 +111,68 @@ func TestHMACKeyFileLoading(t *testing.T) {
 	}
 }
 
+func TestHMACKeyPersistenceAndValidation(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "honeypot.log")
+
+	// 1. Same persistent key across restarts must produce identical HMAC
+	keyFile := filepath.Join(tempDir, "valid.key")
+	if err := os.WriteFile(keyFile, []byte("persistent-production-hmac-key-32b\n"), 0o600); err != nil {
+		t.Fatalf("write valid key: %v", err)
+	}
+	t.Setenv("HMAC_KEY_FILE", keyFile)
+
+	l1, err := New(logPath)
+	if err != nil {
+		t.Fatalf("first logger init: %v", err)
+	}
+	msgs := []models.Message{{Role: "user", Content: "same payload"}}
+	firstMAC := l1.hashMessages(msgs)
+	_ = l1.Close()
+
+	l2, err := New(logPath)
+	if err != nil {
+		t.Fatalf("second logger init: %v", err)
+	}
+	secondMAC := l2.hashMessages(msgs)
+	_ = l2.Close()
+
+	if firstMAC != secondMAC {
+		t.Errorf("expected identical HMAC across restarts, got %s vs %s", firstMAC, secondMAC)
+	}
+
+	// 2. Key file with open permissions (0644) must be rejected
+	insecureFile := filepath.Join(tempDir, "insecure.key")
+	if err := os.WriteFile(insecureFile, []byte("persistent-production-hmac-key-32b\n"), 0o644); err != nil {
+		t.Fatalf("write insecure key: %v", err)
+	}
+	if err := os.Chmod(insecureFile, 0o644); err != nil {
+		t.Fatalf("chmod insecure key: %v", err)
+	}
+	t.Setenv("HMAC_KEY_FILE", insecureFile)
+	if _, err := New(logPath); err == nil {
+		t.Errorf("expected error when HMAC_KEY_FILE has 0644 permissions, got nil")
+	}
+
+	// 3. Short key (< 16 bytes) must be rejected
+	shortFile := filepath.Join(tempDir, "short.key")
+	if err := os.WriteFile(shortFile, []byte("too-short\n"), 0o600); err != nil {
+		t.Fatalf("write short key: %v", err)
+	}
+	t.Setenv("HMAC_KEY_FILE", shortFile)
+	if _, err := New(logPath); err == nil {
+		t.Errorf("expected error when HMAC_KEY_FILE is shorter than 16 bytes, got nil")
+	}
+
+	// 4. REQUIRE_HMAC_KEY=true without any key must fail
+	t.Setenv("HMAC_KEY_FILE", "")
+	t.Setenv("HMAC_KEY", "")
+	t.Setenv("REQUIRE_HMAC_KEY", "true")
+	if _, err := New(logPath); err == nil {
+		t.Errorf("expected error when REQUIRE_HMAC_KEY=true and no key is configured, got nil")
+	}
+}
+
 func TestLogRotation(t *testing.T) {
 	tempDir := t.TempDir()
 	logPath := filepath.Join(tempDir, "honeypot.log")
@@ -182,5 +244,89 @@ func TestUnifiedEventSchemaAcrossAPIAndInfraSensors(t *testing.T) {
 	}
 	if summary.ByEventType["api_recon"] != 1 || summary.ByEventType["ssh_bruteforce"] != 1 {
 		t.Errorf("unexpected ByEventType counts: %+v", summary.ByEventType)
+	}
+	if summary.TotalEvents != 2 || summary.SuspiciousEvents != 1 {
+		t.Errorf("TotalEvents=%d SuspiciousEvents=%d, want 2 and 1", summary.TotalEvents, summary.SuspiciousEvents)
+	}
+	if summary.ByEventSeverity[detection.SeverityHigh] != 1 || summary.ByEventSeverity["info"] != 1 {
+		t.Errorf("unexpected ByEventSeverity: %+v", summary.ByEventSeverity)
+	}
+}
+
+func TestSummarizeLargeLogLine(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "honeypot.log")
+	reqLogger, err := New(logPath)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	// Write a JSONL event larger than default 64KB bufio.Scanner limit (e.g., ~100KB metadata)
+	if err := reqLogger.LogEvent(models.Event{
+		Sensor:    models.SensorProcess,
+		SourceIP:  "127.0.0.1",
+		EventType: "process_exec",
+		Severity:  detection.SeverityMedium,
+		Target:    "/usr/bin/python3",
+		Metadata: map[string]any{
+			"large_cmdline": strings.Repeat("A", 100*1024),
+		},
+	}); err != nil {
+		t.Fatalf("LogEvent() error: %v", err)
+	}
+	_ = reqLogger.Close()
+
+	summary, err := Summarize(logPath)
+	if err != nil {
+		t.Fatalf("Summarize() failed on >64KB line: %v", err)
+	}
+	if summary.TotalEvents != 1 || summary.ByEventSeverity[detection.SeverityMedium] != 1 {
+		t.Errorf("unexpected summary on large line: %+v", summary)
+	}
+}
+
+func TestLoggerReturnsErrorWhenClosed(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "honeypot.log")
+	reqLogger, err := New(logPath)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if err := reqLogger.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+
+	if err := reqLogger.LogEvent(models.Event{Sensor: models.SensorAPI, EventType: "test"}); err == nil {
+		t.Errorf("expected LogEvent on closed logger to return error, got nil")
+	}
+}
+
+func TestHashMessagesNoDelimiterCollision(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "honeypot.log")
+	reqLogger, err := New(logPath)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer reqLogger.Close()
+
+	// Case 1: Role/Content boundary ambiguity ("user:admin" + "hello" vs "user" + "admin:hello")
+	fpRoleShiftA := reqLogger.hashMessages([]models.Message{
+		{Role: "user:admin", Content: "hello"},
+	})
+	fpRoleShiftB := reqLogger.hashMessages([]models.Message{
+		{Role: "user", Content: "admin:hello"},
+	})
+	if fpRoleShiftA == fpRoleShiftB {
+		t.Errorf("collision between shifted role/content boundaries: %s", fpRoleShiftA)
+	}
+
+	// Case 2: Single message with embedded newline vs two separate messages
+	fpSingleWithNewline := reqLogger.hashMessages([]models.Message{
+		{Role: "user", Content: "first\nuser:second"},
+	})
+	fpTwoMessages := reqLogger.hashMessages([]models.Message{
+		{Role: "user", Content: "first"},
+		{Role: "user", Content: "second"},
+	})
+	if fpSingleWithNewline == fpTwoMessages {
+		t.Errorf("collision between single message with newline and two messages: %s", fpSingleWithNewline)
 	}
 }

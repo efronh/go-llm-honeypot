@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -54,7 +55,11 @@ func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.logger.LogRequest(r, models.ChatCompletionRequest{}, []detection.Finding{})
+	if err := h.logger.LogRequest(r, models.ChatCompletionRequest{}, []detection.Finding{}); err != nil {
+		log.Printf("failed to log /v1/models request: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, models.ModelListResponse{
 		Object: "list",
@@ -112,7 +117,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	findings := h.detector.Analyze(request)
-	h.logger.LogRequest(r, request, findings)
+	if err := h.logger.LogRequest(r, request, findings); err != nil {
+		log.Printf("failed to log chat completion request: %v", err)
+		http.Error(w, "internal server error", http.StatusInternalServerError)
+		return
+	}
 
 	model := request.Model
 	if model == "" {

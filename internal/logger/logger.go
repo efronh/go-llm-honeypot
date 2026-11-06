@@ -21,7 +21,11 @@ import (
 	"github.com/efronh/go-llm-honeypot/internal/models"
 )
 
-const defaultMaxLogSize = 10 << 20 // 10 MB
+const (
+	defaultMaxLogSize = 10 << 20 // 10 MB
+	maxScannerBuffer  = 1 << 20  // 1 MB max line size for Summarize
+	minHMACKeyLength  = 16
+)
 
 type Logger struct {
 	mu          sync.Mutex
@@ -65,6 +69,10 @@ func (l *Logger) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
+	if l.file == nil {
+		return 0, errors.New("logger file is closed")
+	}
+
 	if l.maxSize > 0 && l.currentSize > 0 && l.currentSize+int64(len(p)) > l.maxSize {
 		if err := l.rotate(); err != nil {
 			return 0, err
@@ -96,7 +104,7 @@ func (l *Logger) rotate() error {
 	return nil
 }
 
-func (l *Logger) LogEvent(event models.Event) {
+func (l *Logger) LogEvent(event models.Event) error {
 	if event.EventID == "" {
 		event.EventID = newEventID()
 	}
@@ -109,13 +117,14 @@ func (l *Logger) LogEvent(event models.Event) {
 
 	line, err := json.Marshal(event)
 	if err != nil {
-		return
+		return err
 	}
 	line = append(line, '\n')
-	_, _ = l.Write(line)
+	_, err = l.Write(line)
+	return err
 }
 
-func (l *Logger) LogRequest(r *http.Request, request models.ChatCompletionRequest, findings []detection.Finding) {
+func (l *Logger) LogRequest(r *http.Request, request models.ChatCompletionRequest, findings []detection.Finding) error {
 	hasAuth, authScheme, authHMAC := l.inspectAuthHeader(r)
 	promptHMAC := l.hashMessages(request.Messages)
 	srcIP, srcPort := splitAddr(r.RemoteAddr)
@@ -151,7 +160,7 @@ func (l *Logger) LogRequest(r *http.Request, request models.ChatCompletionReques
 		},
 	}
 
-	l.LogEvent(event)
+	return l.LogEvent(event)
 }
 
 func classifyAPIEvent(path string, findings []detection.Finding) (string, string, float64) {
@@ -222,14 +231,11 @@ func (l *Logger) hashMessages(messages []models.Message) string {
 	if len(messages) == 0 {
 		return ""
 	}
-	mac := hmac.New(sha256.New, l.hmacKey)
-	for _, msg := range messages {
-		mac.Write([]byte(msg.Role))
-		mac.Write([]byte(":"))
-		mac.Write([]byte(msg.Content))
-		mac.Write([]byte("\n"))
+	encoded, err := json.Marshal(messages)
+	if err != nil {
+		return ""
 	}
-	return hex.EncodeToString(mac.Sum(nil))
+	return computeHMAC(l.hmacKey, encoded)
 }
 
 func computeHMAC(key, data []byte) string {
@@ -240,19 +246,36 @@ func computeHMAC(key, data []byte) string {
 
 func loadHMACKey() ([]byte, error) {
 	if keyFile := strings.TrimSpace(os.Getenv("HMAC_KEY_FILE")); keyFile != "" {
+		info, err := os.Stat(keyFile)
+		if err != nil {
+			return nil, err
+		}
+		if !info.Mode().IsRegular() {
+			return nil, errors.New("HMAC_KEY_FILE must be a regular file")
+		}
+		if info.Mode().Perm()&0o077 != 0 {
+			return nil, errors.New("HMAC_KEY_FILE permissions are too open: must not be accessible by group or others (use 0600 or 0400)")
+		}
 		data, err := os.ReadFile(keyFile)
 		if err != nil {
 			return nil, err
 		}
 		trimmed := bytes.TrimSpace(data)
-		if len(trimmed) == 0 {
-			return nil, errors.New("HMAC_KEY_FILE is empty")
+		if len(trimmed) < minHMACKeyLength {
+			return nil, errors.New("HMAC key in HMAC_KEY_FILE must be at least 16 bytes")
 		}
 		return trimmed, nil
 	}
 
 	if envKey := strings.TrimSpace(os.Getenv("HMAC_KEY")); envKey != "" {
+		if len(envKey) < minHMACKeyLength {
+			return nil, errors.New("HMAC_KEY must be at least 16 bytes")
+		}
 		return []byte(envKey), nil
+	}
+
+	if strings.EqualFold(strings.TrimSpace(os.Getenv("REQUIRE_HMAC_KEY")), "true") {
+		return nil, errors.New("persistent HMAC_KEY_FILE or HMAC_KEY is required when REQUIRE_HMAC_KEY=true")
 	}
 
 	ephemeral := make([]byte, 32)
@@ -268,14 +291,20 @@ func (l *Logger) Close() error {
 	if l.file == nil {
 		return nil
 	}
-	return l.file.Close()
+	err := l.file.Close()
+	l.file = nil
+	return err
 }
 
 type Summary struct {
+	TotalEvents        int            `json:"total_events"`
+	SuspiciousEvents   int            `json:"suspicious_events"`
 	TotalRequests      int            `json:"total_requests"`
 	SuspiciousRequests int            `json:"suspicious_requests"`
 	BySensor           map[string]int `json:"by_sensor"`
 	ByEventType        map[string]int `json:"by_event_type"`
+	ByEventSeverity    map[string]int `json:"by_event_severity"`
+	ByFindingSeverity  map[string]int `json:"by_finding_severity"`
 	ByPath             map[string]int `json:"by_path"`
 	ByModel            map[string]int `json:"by_model"`
 	ByCategory         map[string]int `json:"by_category"`
@@ -283,12 +312,12 @@ type Summary struct {
 }
 
 type storedEvent struct {
-	Sensor    string            `json:"sensor"`
-	EventType string            `json:"event_type"`
-	Severity  string            `json:"severity"`
-	Target    string            `json:"target"`
-	Path      string            `json:"path"`
-	Metadata  storedEventMeta   `json:"metadata"`
+	Sensor    string              `json:"sensor"`
+	EventType string              `json:"event_type"`
+	Severity  string              `json:"severity"`
+	Target    string              `json:"target"`
+	Path      string              `json:"path"`
+	Metadata  storedEventMeta     `json:"metadata"`
 	Findings  []detection.Finding `json:"findings"`
 }
 
@@ -300,12 +329,14 @@ type storedEventMeta struct {
 
 func Summarize(path string) (Summary, error) {
 	summary := Summary{
-		BySensor:    make(map[string]int),
-		ByEventType: make(map[string]int),
-		ByPath:      make(map[string]int),
-		ByModel:     make(map[string]int),
-		ByCategory:  make(map[string]int),
-		BySeverity:  make(map[string]int),
+		BySensor:          make(map[string]int),
+		ByEventType:       make(map[string]int),
+		ByEventSeverity:   make(map[string]int),
+		ByFindingSeverity: make(map[string]int),
+		ByPath:            make(map[string]int),
+		ByModel:           make(map[string]int),
+		ByCategory:        make(map[string]int),
+		BySeverity:        make(map[string]int),
 	}
 
 	file, err := os.Open(path)
@@ -315,6 +346,8 @@ func Summarize(path string) (Summary, error) {
 	defer file.Close()
 
 	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), maxScannerBuffer)
+
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		if len(line) == 0 {
@@ -326,12 +359,18 @@ func Summarize(path string) (Summary, error) {
 			continue
 		}
 
+		summary.TotalEvents++
 		summary.TotalRequests++
+
 		if ev.Sensor != "" {
 			summary.BySensor[ev.Sensor]++
 		}
 		if ev.EventType != "" {
 			summary.ByEventType[ev.EventType]++
+		}
+		if ev.Severity != "" {
+			summary.ByEventSeverity[ev.Severity]++
+			summary.BySeverity[ev.Severity]++
 		}
 
 		target := ev.Target
@@ -353,6 +392,7 @@ func Summarize(path string) (Summary, error) {
 
 		isSuspicious := ev.Metadata.IsSuspicious || len(findings) > 0 || (ev.Severity != "" && ev.Severity != "info")
 		if isSuspicious {
+			summary.SuspiciousEvents++
 			summary.SuspiciousRequests++
 		}
 
@@ -361,7 +401,7 @@ func Summarize(path string) (Summary, error) {
 				summary.ByCategory[f.Category]++
 			}
 			if f.Severity != "" {
-				summary.BySeverity[f.Severity]++
+				summary.ByFindingSeverity[f.Severity]++
 			}
 		}
 	}
