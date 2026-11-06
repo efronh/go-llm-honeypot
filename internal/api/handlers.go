@@ -88,12 +88,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer r.Body.Close()
 
 	var request models.ChatCompletionRequest
+	var maxBytesErr *http.MaxBytesError
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&request); err != nil {
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "invalid JSON request", http.StatusBadRequest)
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "request must contain a single JSON value", http.StatusBadRequest)
 		return
 	}

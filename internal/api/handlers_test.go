@@ -120,6 +120,12 @@ func TestChatCompletionsEndpoint(t *testing.T) {
 			expectedStatus: http.StatusBadRequest,
 		},
 		{
+			name:           "oversized request body returns 413 Request Entity Too Large",
+			method:         http.MethodPost,
+			body:           `{"model":"gpt-4o","messages":[{"role":"user","content":"` + strings.Repeat("A", maxRequestBody+100) + `"}]}`,
+			expectedStatus: http.StatusRequestEntityTooLarge,
+		},
+		{
 			name:           "valid request returns 200 OK",
 			method:         http.MethodPost,
 			body:           `{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}`,

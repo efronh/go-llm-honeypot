@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -34,6 +35,7 @@ func main() {
 		return
 	}
 
+	host := envOrDefault("HOST", "127.0.0.1")
 	port := envOrDefault("PORT", "8080")
 	if _, err := strconv.Atoi(port); err != nil {
 		log.Fatalf("invalid PORT %q: must be a number", port)
@@ -53,9 +55,13 @@ func main() {
 	api.NewHandler(detection.NewDetector(), requestLogger).RegisterRoutes(mux)
 
 	server := &http.Server{
-		Addr:              ":" + port,
+		Addr:              net.JoinHostPort(host, port),
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 14,
 	}
 
 	log.Printf("go-llm-honeypot listening on %s", server.Addr)
