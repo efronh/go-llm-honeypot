@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/efronh/go-llm-honeypot/internal/detection"
@@ -74,8 +75,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	model := request.Model
 	if model == "" {
-		model = "honeypot-stub"
+		model = "gpt-4o-mini"
 	}
+	reply := buildDecoyReply(findings)
+	usage := calculateUsage(request.Messages, reply)
+
 	writeJSON(w, http.StatusOK, models.ChatCompletionResponse{
 		ID:      "chatcmpl-" + time.Now().UTC().Format("20060102T150405.000000000"),
 		Object:  "chat.completion",
@@ -85,16 +89,47 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			Index: 0,
 			Message: models.Message{
 				Role:    "assistant",
-				Content: "Request received.",
+				Content: reply,
 			},
 			FinishReason: "stop",
 		}},
-		Usage: models.Usage{
-			PromptTokens:     0,
-			CompletionTokens: 0,
-			TotalTokens:      0,
-		},
+		Usage: usage,
 	})
+}
+
+func buildDecoyReply(findings []detection.Finding) string {
+	for _, f := range findings {
+		switch f.Category {
+		case detection.CategorySystemPromptExtraction:
+			return "I cannot share internal system instructions or configuration details. How else can I assist you?"
+		case detection.CategoryPromptInjection, detection.CategoryJailbreak:
+			return "I'm sorry, but I cannot comply with instructions that override safety guidelines or system policies."
+		case detection.CategoryRoleManipulation, detection.CategoryObfuscation:
+			return "I can only process standard user requests in plain text. Please rephrase your request."
+		}
+	}
+	return "I have processed your request. Could you provide more details on how you would like to proceed?"
+}
+
+func estimateTokens(text string) int {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return 0
+	}
+	return (len(trimmed) + 3) / 4
+}
+
+func calculateUsage(messages []models.Message, reply string) models.Usage {
+	promptTokens := 0
+	for _, msg := range messages {
+		promptTokens += 3 + estimateTokens(msg.Role) + estimateTokens(msg.Content)
+	}
+	completionTokens := estimateTokens(reply)
+	return models.Usage{
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      promptTokens + completionTokens,
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

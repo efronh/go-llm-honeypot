@@ -125,8 +125,11 @@ func TestChatCompletionsEndpoint(t *testing.T) {
 				if resp.Model != "gpt-4o" {
 					t.Errorf("response model = %q, want %q", resp.Model, "gpt-4o")
 				}
-				if len(resp.Choices) != 1 || resp.Choices[0].Message.Content != "Request received." {
+				if len(resp.Choices) != 1 || resp.Choices[0].Message.Content == "" {
 					t.Errorf("unexpected choices: %+v", resp.Choices)
+				}
+				if resp.Usage.TotalTokens <= 0 || resp.Usage.TotalTokens != resp.Usage.PromptTokens+resp.Usage.CompletionTokens {
+					t.Errorf("unexpected token usage: %+v", resp.Usage)
 				}
 			}
 		})
