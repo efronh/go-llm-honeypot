@@ -54,19 +54,23 @@ func main() {
 	mux := http.NewServeMux()
 	api.NewHandler(detection.NewDetector(), requestLogger).RegisterRoutes(mux)
 
-	server := &http.Server{
+	server := newServer(host, port, mux)
+
+	log.Printf("go-llm-honeypot listening on %s", server.Addr)
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatalf("server failed: %v", err)
+	}
+}
+
+func newServer(host, port string, handler http.Handler) *http.Server {
+	return &http.Server{
 		Addr:              net.JoinHostPort(host, port),
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 14,
-	}
-
-	log.Printf("go-llm-honeypot listening on %s", server.Addr)
-	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("server failed: %v", err)
 	}
 }
 
