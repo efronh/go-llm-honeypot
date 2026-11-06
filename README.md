@@ -2,8 +2,6 @@
 
 A lightweight, zero-dependency HTTP honeypot written in Go that emulates an OpenAI-compatible LLM API (`/v1/models` and `/v1/chat/completions`) to capture, classify, and analyze adversarial AI interactions.
 
-Designed as an **AI Security & Deception Engineering** project using only the Go standard library.
-
 ---
 
 ## Key Features
