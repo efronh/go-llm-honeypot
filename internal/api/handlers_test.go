@@ -64,6 +64,28 @@ func TestHealthEndpoint(t *testing.T) {
 	}
 }
 
+func TestModelsEndpoint(t *testing.T) {
+	mux := newTestMux(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer sk-test-key-123")
+	rec := httptest.NewRecorder()
+
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	var resp models.ModelListResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode models response: %v", err)
+	}
+	if resp.Object != "list" || len(resp.Data) == 0 {
+		t.Errorf("unexpected model list response: %+v", resp)
+	}
+}
+
 func TestChatCompletionsEndpoint(t *testing.T) {
 	mux := newTestMux(t)
 

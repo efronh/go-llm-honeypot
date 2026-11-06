@@ -31,6 +31,7 @@ func NewHandler(detector *detection.Detector, requestLogger *logger.Logger) *Han
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", h.health)
+	mux.HandleFunc("/v1/models", h.listModels)
 	mux.HandleFunc("/v1/chat/completions", h.chatCompletions)
 }
 
@@ -41,6 +42,37 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !h.limiter.Allow(clientIP(r.RemoteAddr)) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
+	h.logger.LogRequest(r, models.ChatCompletionRequest{}, []detection.Finding{})
+
+	writeJSON(w, http.StatusOK, models.ModelListResponse{
+		Object: "list",
+		Data: []models.ModelInfo{
+			{
+				ID:      "gpt-4o",
+				Object:  "model",
+				Created: 1715368132,
+				OwnedBy: "system",
+			},
+			{
+				ID:      "gpt-4o-mini",
+				Object:  "model",
+				Created: 1721172741,
+				OwnedBy: "system",
+			},
+		},
+	})
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
