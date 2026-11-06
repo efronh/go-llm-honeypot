@@ -139,3 +139,48 @@ func TestLogRotation(t *testing.T) {
 		t.Fatalf("expected active log file %s to exist: %v", logPath, err)
 	}
 }
+
+func TestUnifiedEventSchemaAcrossAPIAndInfraSensors(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "honeypot.log")
+	reqLogger, err := New(logPath)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+
+	// 1. API Reconnaissance event (/v1/models)
+	reconReq := httptest.NewRequest("GET", "/v1/models", nil)
+	reconReq.RemoteAddr = "192.0.2.10:51000"
+	reconReq.Header.Set("Authorization", "Bearer sk-shared-campaign-key")
+	reqLogger.LogRequest(reconReq, models.ChatCompletionRequest{}, []detection.Finding{})
+
+	// 2. Infrastructure SSH brute-force event from the same IP
+	reqLogger.LogEvent(models.Event{
+		Sensor:       models.SensorSSH,
+		SourceIP:     "192.0.2.10",
+		EventType:    "ssh_bruteforce",
+		Severity:     detection.SeverityHigh,
+		Confidence:   0.95,
+		Target:       "ssh:22",
+		EvidenceHash: "hmac-user-root",
+		Metadata: map[string]any{
+			"username": "root",
+			"attempts": 15,
+		},
+	})
+
+	if err := reqLogger.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+
+	summary, err := Summarize(logPath)
+	if err != nil {
+		t.Fatalf("Summarize() error: %v", err)
+	}
+
+	if summary.BySensor[models.SensorAPI] != 1 || summary.BySensor[models.SensorSSH] != 1 {
+		t.Errorf("unexpected BySensor counts: %+v", summary.BySensor)
+	}
+	if summary.ByEventType["api_recon"] != 1 || summary.ByEventType["ssh_bruteforce"] != 1 {
+		t.Errorf("unexpected ByEventType counts: %+v", summary.ByEventType)
+	}
+}

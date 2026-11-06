@@ -42,3 +42,23 @@ type ModelInfo struct {
 	Created int64  `json:"created"`
 	OwnedBy string `json:"owned_by"`
 }
+
+const (
+	SensorAPI     = "api"
+	SensorSSH     = "ssh"
+	SensorNetwork = "network"
+	SensorProcess = "process"
+)
+
+type Event struct {
+	EventID      string         `json:"event_id"`
+	Timestamp    string         `json:"timestamp"`
+	Sensor       string         `json:"sensor"`
+	SourceIP     string         `json:"source_ip"`
+	EventType    string         `json:"event_type"`
+	Severity     string         `json:"severity"`
+	Confidence   float64        `json:"confidence"`
+	Target       string         `json:"target"`
+	EvidenceHash string         `json:"evidence_hash"`
+	Metadata     map[string]any `json:"metadata"`
+}

@@ -9,12 +9,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/efronh/go-llm-honeypot/internal/detection"
 	"github.com/efronh/go-llm-honeypot/internal/models"
@@ -26,7 +27,6 @@ type Logger struct {
 	mu          sync.Mutex
 	path        string
 	file        *os.File
-	logger      *slog.Logger
 	hmacKey     []byte
 	maxSize     int64
 	currentSize int64
@@ -52,15 +52,13 @@ func New(path string) (*Logger, error) {
 		return nil, err
 	}
 
-	l := &Logger{
+	return &Logger{
 		path:        path,
 		file:        file,
 		hmacKey:     hmacKey,
 		maxSize:     defaultMaxLogSize,
 		currentSize: info.Size(),
-	}
-	l.logger = slog.New(slog.NewJSONHandler(l, nil))
-	return l, nil
+	}, nil
 }
 
 func (l *Logger) Write(p []byte) (int, error) {
@@ -98,24 +96,109 @@ func (l *Logger) rotate() error {
 	return nil
 }
 
+func (l *Logger) LogEvent(event models.Event) {
+	if event.EventID == "" {
+		event.EventID = newEventID()
+	}
+	if event.Timestamp == "" {
+		event.Timestamp = time.Now().UTC().Format(time.RFC3339Nano)
+	}
+	if event.Metadata == nil {
+		event.Metadata = map[string]any{}
+	}
+
+	line, err := json.Marshal(event)
+	if err != nil {
+		return
+	}
+	line = append(line, '\n')
+	_, _ = l.Write(line)
+}
+
 func (l *Logger) LogRequest(r *http.Request, request models.ChatCompletionRequest, findings []detection.Finding) {
 	hasAuth, authScheme, authHMAC := l.inspectAuthHeader(r)
+	promptHMAC := l.hashMessages(request.Messages)
+	srcIP, srcPort := splitAddr(r.RemoteAddr)
 
-	l.logger.Info("request received",
-		"event_type", "api_request",
-		"method", r.Method,
-		"path", r.URL.Path,
-		"remote_addr", r.RemoteAddr,
-		"user_agent", r.UserAgent(),
-		"has_auth_header", hasAuth,
-		"auth_scheme", authScheme,
-		"auth_hmac_sha256", authHMAC,
-		"model", request.Model,
-		"message_count", len(request.Messages),
-		"prompt_hmac_sha256", l.hashMessages(request.Messages),
-		"is_suspicious", len(findings) > 0,
-		"findings", findings,
-	)
+	eventType, severity, confidence := classifyAPIEvent(r.URL.Path, findings)
+	evidenceHash := promptHMAC
+	if evidenceHash == "" {
+		evidenceHash = authHMAC
+	}
+
+	event := models.Event{
+		EventID:      newEventID(),
+		Timestamp:    time.Now().UTC().Format(time.RFC3339Nano),
+		Sensor:       models.SensorAPI,
+		SourceIP:     srcIP,
+		EventType:    eventType,
+		Severity:     severity,
+		Confidence:   confidence,
+		Target:       r.URL.Path,
+		EvidenceHash: evidenceHash,
+		Metadata: map[string]any{
+			"method":             r.Method,
+			"source_port":        srcPort,
+			"user_agent":         r.UserAgent(),
+			"has_auth_header":    hasAuth,
+			"auth_scheme":        authScheme,
+			"auth_hmac_sha256":   authHMAC,
+			"model":              request.Model,
+			"message_count":      len(request.Messages),
+			"prompt_hmac_sha256": promptHMAC,
+			"is_suspicious":      len(findings) > 0,
+			"findings":           findings,
+		},
+	}
+
+	l.LogEvent(event)
+}
+
+func classifyAPIEvent(path string, findings []detection.Finding) (string, string, float64) {
+	if len(findings) == 0 {
+		if path == "/v1/models" {
+			return "api_recon", "info", 1.0
+		}
+		return "benign_request", "info", 1.0
+	}
+
+	primary := findings[0]
+	for _, f := range findings[1:] {
+		if severityRank(f.Severity) > severityRank(primary.Severity) {
+			primary = f
+		}
+	}
+	return primary.Category, primary.Severity, primary.Confidence
+}
+
+func severityRank(severity string) int {
+	switch severity {
+	case detection.SeverityHigh:
+		return 3
+	case detection.SeverityMedium:
+		return 2
+	case detection.SeverityLow:
+		return 1
+	default:
+		return 0
+	}
+}
+
+func splitAddr(remoteAddr string) (string, string) {
+	trimmed := strings.TrimSpace(remoteAddr)
+	host, port, err := net.SplitHostPort(trimmed)
+	if err != nil {
+		return trimmed, ""
+	}
+	return host, port
+}
+
+func newEventID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "evt-" + time.Now().UTC().Format("20060102150405.000000")
+	}
+	return "evt-" + hex.EncodeToString(b[:])
 }
 
 func (l *Logger) inspectAuthHeader(r *http.Request) (bool, string, string) {
@@ -191,14 +274,25 @@ func (l *Logger) Close() error {
 type Summary struct {
 	TotalRequests      int            `json:"total_requests"`
 	SuspiciousRequests int            `json:"suspicious_requests"`
+	BySensor           map[string]int `json:"by_sensor"`
+	ByEventType        map[string]int `json:"by_event_type"`
 	ByPath             map[string]int `json:"by_path"`
 	ByModel            map[string]int `json:"by_model"`
 	ByCategory         map[string]int `json:"by_category"`
 	BySeverity         map[string]int `json:"by_severity"`
 }
 
-type logEntry struct {
-	Path         string              `json:"path"`
+type storedEvent struct {
+	Sensor    string            `json:"sensor"`
+	EventType string            `json:"event_type"`
+	Severity  string            `json:"severity"`
+	Target    string            `json:"target"`
+	Path      string            `json:"path"`
+	Metadata  storedEventMeta   `json:"metadata"`
+	Findings  []detection.Finding `json:"findings"`
+}
+
+type storedEventMeta struct {
 	Model        string              `json:"model"`
 	IsSuspicious bool                `json:"is_suspicious"`
 	Findings     []detection.Finding `json:"findings"`
@@ -206,10 +300,12 @@ type logEntry struct {
 
 func Summarize(path string) (Summary, error) {
 	summary := Summary{
-		ByPath:     make(map[string]int),
-		ByModel:    make(map[string]int),
-		ByCategory: make(map[string]int),
-		BySeverity: make(map[string]int),
+		BySensor:    make(map[string]int),
+		ByEventType: make(map[string]int),
+		ByPath:      make(map[string]int),
+		ByModel:     make(map[string]int),
+		ByCategory:  make(map[string]int),
+		BySeverity:  make(map[string]int),
 	}
 
 	file, err := os.Open(path)
@@ -225,22 +321,42 @@ func Summarize(path string) (Summary, error) {
 			continue
 		}
 
-		var entry logEntry
-		if err := json.Unmarshal(line, &entry); err != nil {
+		var ev storedEvent
+		if err := json.Unmarshal(line, &ev); err != nil {
 			continue
 		}
 
 		summary.TotalRequests++
-		if entry.Path != "" {
-			summary.ByPath[entry.Path]++
+		if ev.Sensor != "" {
+			summary.BySensor[ev.Sensor]++
 		}
-		if entry.Model != "" {
-			summary.ByModel[entry.Model]++
+		if ev.EventType != "" {
+			summary.ByEventType[ev.EventType]++
 		}
-		if entry.IsSuspicious || len(entry.Findings) > 0 {
+
+		target := ev.Target
+		if target == "" {
+			target = ev.Path
+		}
+		if target != "" {
+			summary.ByPath[target]++
+		}
+
+		if ev.Metadata.Model != "" {
+			summary.ByModel[ev.Metadata.Model]++
+		}
+
+		findings := ev.Metadata.Findings
+		if len(findings) == 0 {
+			findings = ev.Findings
+		}
+
+		isSuspicious := ev.Metadata.IsSuspicious || len(findings) > 0 || (ev.Severity != "" && ev.Severity != "info")
+		if isSuspicious {
 			summary.SuspiciousRequests++
 		}
-		for _, f := range entry.Findings {
+
+		for _, f := range findings {
 			if f.Category != "" {
 				summary.ByCategory[f.Category]++
 			}
