@@ -38,7 +38,10 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		if h.checkRateLimit(w, r) {
+			_ = h.logger.LogRejectedRequest(r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		}
 		return
 	}
 
@@ -46,12 +49,12 @@ func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !h.checkRateLimit(w, r) {
 		return
 	}
-	if !h.limiter.Allow(clientIP(r.RemoteAddr)) {
-		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+	if r.Method != http.MethodGet {
+		_ = h.logger.LogRejectedRequest(r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
@@ -81,12 +84,12 @@ func (h *Handler) listModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	if !h.checkRateLimit(w, r) {
 		return
 	}
-	if !h.limiter.Allow(clientIP(r.RemoteAddr)) {
-		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+	if r.Method != http.MethodPost {
+		_ = h.logger.LogRejectedRequest(r, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", nil)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
@@ -97,21 +100,26 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&request); err != nil {
 		if errors.As(err, &maxBytesErr) {
+			_ = h.logger.LogRejectedRequest(r, http.StatusRequestEntityTooLarge, "payload_too_large", "request body too large", nil)
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
+		_ = h.logger.LogRejectedRequest(r, http.StatusBadRequest, "malformed_json", "invalid JSON request", nil)
 		http.Error(w, "invalid JSON request", http.StatusBadRequest)
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
 		if errors.As(err, &maxBytesErr) {
+			_ = h.logger.LogRejectedRequest(r, http.StatusRequestEntityTooLarge, "payload_too_large", "request body too large", nil)
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
+		_ = h.logger.LogRejectedRequest(r, http.StatusBadRequest, "multiple_json_values", "request must contain a single JSON value", nil)
 		http.Error(w, "request must contain a single JSON value", http.StatusBadRequest)
 		return
 	}
 	if len(request.Messages) == 0 {
+		_ = h.logger.LogRejectedRequest(r, http.StatusBadRequest, "empty_messages", "messages must not be empty", nil)
 		http.Error(w, "messages must not be empty", http.StatusBadRequest)
 		return
 	}
@@ -145,6 +153,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}},
 		Usage: usage,
 	})
+}
+
+func (h *Handler) checkRateLimit(w http.ResponseWriter, r *http.Request) bool {
+	allowed, shouldLog, violations := h.limiter.Check(clientIP(r.RemoteAddr))
+	if !allowed {
+		if shouldLog {
+			_ = h.logger.LogRejectedRequest(r, http.StatusTooManyRequests, "rate_limit_exceeded", "rate limit exceeded", map[string]any{
+				"violation_count": violations,
+			})
+		}
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return false
+	}
+	return true
 }
 
 func buildDecoyReply(findings []detection.Finding) string {

@@ -8,22 +8,25 @@ import (
 )
 
 const (
-	defaultRateLimit  = 30
-	defaultRateWindow = time.Minute
-	maxTrackedClients = 10000
+	defaultRateLimit           = 30
+	defaultRateWindow          = time.Minute
+	maxTrackedClients          = 10000
+	rateLimitLogSampleInterval = 50
 )
 
 type clientWindow struct {
-	count     int
-	windowEnd time.Time
+	count      int
+	violations int
+	windowEnd  time.Time
 }
 
 type RateLimiter struct {
-	mu         sync.Mutex
-	limit      int
-	window     time.Duration
-	maxClients int
-	clients    map[string]clientWindow
+	mu            sync.Mutex
+	limit         int
+	window        time.Duration
+	maxClients    int
+	overflowCount int
+	clients       map[string]clientWindow
 }
 
 func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
@@ -42,6 +45,11 @@ func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
 }
 
 func (rl *RateLimiter) Allow(ip string) bool {
+	allowed, _, _ := rl.Check(ip)
+	return allowed
+}
+
+func (rl *RateLimiter) Check(ip string) (allowed bool, shouldLog bool, violations int) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 
@@ -53,20 +61,25 @@ func (rl *RateLimiter) Allow(ip string) bool {
 				count:     1,
 				windowEnd: now.Add(rl.window),
 			}
-			return true
+			return true, false, 0
 		}
 		if state.count >= rl.limit {
-			return false
+			state.violations++
+			rl.clients[ip] = state
+			sample := state.violations == 1 || state.violations%rateLimitLogSampleInterval == 0
+			return false, sample, state.violations
 		}
 		state.count++
 		rl.clients[ip] = state
-		return true
+		return true, false, 0
 	}
 
 	if len(rl.clients) >= rl.maxClients {
 		rl.evictExpired(now)
 		if len(rl.clients) >= rl.maxClients {
-			return false
+			rl.overflowCount++
+			sample := rl.overflowCount == 1 || rl.overflowCount%rateLimitLogSampleInterval == 0
+			return false, sample, rl.overflowCount
 		}
 	}
 
@@ -74,7 +87,7 @@ func (rl *RateLimiter) Allow(ip string) bool {
 		count:     1,
 		windowEnd: now.Add(rl.window),
 	}
-	return true
+	return true, false, 0
 }
 
 func (rl *RateLimiter) evictExpired(now time.Time) {

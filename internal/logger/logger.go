@@ -163,6 +163,48 @@ func (l *Logger) LogRequest(r *http.Request, request models.ChatCompletionReques
 	return l.LogEvent(event)
 }
 
+func (l *Logger) LogRejectedRequest(r *http.Request, statusCode int, eventType string, reason string, extraMeta map[string]any) error {
+	hasAuth, authScheme, authHMAC := l.inspectAuthHeader(r)
+	srcIP, srcPort := splitAddr(r.RemoteAddr)
+
+	severity := detection.SeverityLow
+	isSuspicious := false
+	if statusCode == http.StatusTooManyRequests || statusCode == http.StatusRequestEntityTooLarge || eventType == "multiple_json_values" {
+		severity = detection.SeverityMedium
+		isSuspicious = true
+	}
+
+	meta := map[string]any{
+		"method":           r.Method,
+		"source_port":      srcPort,
+		"user_agent":       r.UserAgent(),
+		"status_code":      statusCode,
+		"reason":           reason,
+		"has_auth_header":  hasAuth,
+		"auth_scheme":      authScheme,
+		"auth_hmac_sha256": authHMAC,
+		"is_suspicious":    isSuspicious,
+	}
+	for k, v := range extraMeta {
+		meta[k] = v
+	}
+
+	event := models.Event{
+		EventID:      newEventID(),
+		Timestamp:    time.Now().UTC().Format(time.RFC3339Nano),
+		Sensor:       models.SensorAPI,
+		SourceIP:     srcIP,
+		EventType:    eventType,
+		Severity:     severity,
+		Confidence:   1.0,
+		Target:       r.URL.Path,
+		EvidenceHash: authHMAC,
+		Metadata:     meta,
+	}
+
+	return l.LogEvent(event)
+}
+
 func classifyAPIEvent(path string, findings []detection.Finding) (string, string, float64) {
 	if len(findings) == 0 {
 		if path == "/v1/models" {

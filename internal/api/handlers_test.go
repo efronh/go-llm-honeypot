@@ -358,3 +358,63 @@ func TestHandlerReturns500WhenLoggerFails(t *testing.T) {
 		t.Fatalf("status = %d, want %d when logger fails", rec.Code, http.StatusInternalServerError)
 	}
 }
+
+func TestRejectedRequestsAndRateLimitSamplingTelemetry(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "honeypot.log")
+	reqLogger, err := logger.New(logPath)
+	if err != nil {
+		t.Fatalf("initialize logger: %v", err)
+	}
+	defer reqLogger.Close()
+
+	mux := http.NewServeMux()
+	NewHandler(detection.NewDetector(), reqLogger).RegisterRoutes(mux)
+
+	// 1. 405 Method Not Allowed (from IP 1)
+	req405 := httptest.NewRequest(http.MethodGet, "/v1/chat/completions", nil)
+	req405.RemoteAddr = "198.51.100.10:5000"
+	rec405 := httptest.NewRecorder()
+	mux.ServeHTTP(rec405, req405)
+
+	// 2. 400 Malformed JSON (from IP 1)
+	req400 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{bad`))
+	req400.RemoteAddr = "198.51.100.10:5001"
+	rec400 := httptest.NewRecorder()
+	mux.ServeHTTP(rec400, req400)
+
+	// 3. 413 Payload Too Large (from IP 1)
+	req413 := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+		`{"model":"gpt-4o","messages":[{"role":"user","content":"`+strings.Repeat("A", maxRequestBody+10)+`"}]}`,
+	))
+	req413.RemoteAddr = "198.51.100.10:5002"
+	rec413 := httptest.NewRecorder()
+	mux.ServeHTTP(rec413, req413)
+
+	// 4. Trigger 429 flood from IP 2 (30 allowed + 40 blocked = 70 requests)
+	validBody := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	for i := 0; i < defaultRateLimit+40; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(validBody))
+		req.RemoteAddr = "198.51.100.20:6000"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+	}
+
+	summary, err := logger.Summarize(logPath)
+	if err != nil {
+		t.Fatalf("Summarize() error: %v", err)
+	}
+
+	if summary.ByEventType["method_not_allowed"] != 1 {
+		t.Errorf("method_not_allowed count = %d, want 1", summary.ByEventType["method_not_allowed"])
+	}
+	if summary.ByEventType["malformed_json"] != 1 {
+		t.Errorf("malformed_json count = %d, want 1", summary.ByEventType["malformed_json"])
+	}
+	if summary.ByEventType["payload_too_large"] != 1 {
+		t.Errorf("payload_too_large count = %d, want 1", summary.ByEventType["payload_too_large"])
+	}
+	// Despite 40 blocked (429) requests, sampling must have logged only 1 rate_limit_exceeded event
+	if summary.ByEventType["rate_limit_exceeded"] != 1 {
+		t.Errorf("rate_limit_exceeded count = %d, want 1 (log flood suppression)", summary.ByEventType["rate_limit_exceeded"])
+	}
+}
