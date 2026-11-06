@@ -37,6 +37,14 @@ requested model, message count, SHA-256 prompt fingerprint (`prompt_sha256`),
 `system_prompt_extraction`, `jailbreak`, `role_manipulation`, `obfuscation`).
 It does not store plaintext message contents or raw API keys.
 
+## Telemetry Report
+
+To generate an aggregated JSON summary of recorded events from `LOG_FILE`:
+
+```sh
+go run ./cmd/server -report
+```
+
 ## Test
 
 ```sh

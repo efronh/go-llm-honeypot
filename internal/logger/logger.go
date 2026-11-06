@@ -1,8 +1,10 @@
 package logger
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"net/http"
 	"os"
@@ -76,4 +78,72 @@ func hashMessages(messages []models.Message) string {
 
 func (l *Logger) Close() error {
 	return l.file.Close()
+}
+
+type Summary struct {
+	TotalRequests      int            `json:"total_requests"`
+	SuspiciousRequests int            `json:"suspicious_requests"`
+	ByPath             map[string]int `json:"by_path"`
+	ByModel            map[string]int `json:"by_model"`
+	ByCategory         map[string]int `json:"by_category"`
+	BySeverity         map[string]int `json:"by_severity"`
+}
+
+type logEntry struct {
+	Path         string              `json:"path"`
+	Model        string              `json:"model"`
+	IsSuspicious bool                `json:"is_suspicious"`
+	Findings     []detection.Finding `json:"findings"`
+}
+
+func Summarize(path string) (Summary, error) {
+	summary := Summary{
+		ByPath:     make(map[string]int),
+		ByModel:    make(map[string]int),
+		ByCategory: make(map[string]int),
+		BySeverity: make(map[string]int),
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return summary, err
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var entry logEntry
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+
+		summary.TotalRequests++
+		if entry.Path != "" {
+			summary.ByPath[entry.Path]++
+		}
+		if entry.Model != "" {
+			summary.ByModel[entry.Model]++
+		}
+		if entry.IsSuspicious || len(entry.Findings) > 0 {
+			summary.SuspiciousRequests++
+		}
+		for _, f := range entry.Findings {
+			if f.Category != "" {
+				summary.ByCategory[f.Category]++
+			}
+			if f.Severity != "" {
+				summary.BySeverity[f.Severity]++
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return summary, err
+	}
+	return summary, nil
 }

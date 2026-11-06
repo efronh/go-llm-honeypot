@@ -1,7 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -14,12 +17,29 @@ import (
 )
 
 func main() {
+	reportMode := flag.Bool("report", false, "print telemetry summary from LOG_FILE and exit")
+	flag.Parse()
+
+	logFile := envOrDefault("LOG_FILE", "logs/honeypot.log")
+	if *reportMode {
+		summary, err := logger.Summarize(logFile)
+		if err != nil {
+			log.Fatalf("summarize telemetry log: %v", err)
+		}
+		out, err := json.MarshalIndent(summary, "", "  ")
+		if err != nil {
+			log.Fatalf("format summary: %v", err)
+		}
+		fmt.Println(string(out))
+		return
+	}
+
 	port := envOrDefault("PORT", "8080")
 	if _, err := strconv.Atoi(port); err != nil {
 		log.Fatalf("invalid PORT %q: must be a number", port)
 	}
 
-	requestLogger, err := logger.New(envOrDefault("LOG_FILE", "logs/honeypot.log"))
+	requestLogger, err := logger.New(logFile)
 	if err != nil {
 		log.Fatalf("initialize request logger: %v", err)
 	}
