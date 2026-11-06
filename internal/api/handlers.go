@@ -145,7 +145,7 @@ func buildDecoyReply(findings []detection.Finding) string {
 			return "I cannot share internal system instructions or configuration details. How else can I assist you?"
 		case detection.CategoryPromptInjection, detection.CategoryJailbreak:
 			return "I'm sorry, but I cannot comply with instructions that override safety guidelines or system policies."
-		case detection.CategoryRoleManipulation, detection.CategoryObfuscation:
+		case detection.CategoryRoleManipulation, detection.CategoryObfuscation, detection.CategoryMultiTurn:
 			return "I can only process standard user requests in plain text. Please rephrase your request."
 		}
 	}

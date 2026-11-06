@@ -2,6 +2,7 @@ package api
 
 import (
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -18,17 +19,25 @@ type clientWindow struct {
 }
 
 type RateLimiter struct {
-	mu      sync.Mutex
-	limit   int
-	window  time.Duration
-	clients map[string]clientWindow
+	mu         sync.Mutex
+	limit      int
+	window     time.Duration
+	maxClients int
+	clients    map[string]clientWindow
 }
 
 func NewRateLimiter(limit int, window time.Duration) *RateLimiter {
+	if limit <= 0 {
+		limit = defaultRateLimit
+	}
+	if window <= 0 {
+		window = defaultRateWindow
+	}
 	return &RateLimiter{
-		limit:   limit,
-		window:  window,
-		clients: make(map[string]clientWindow),
+		limit:      limit,
+		window:     window,
+		maxClients: maxTrackedClients,
+		clients:    make(map[string]clientWindow),
 	}
 }
 
@@ -38,33 +47,46 @@ func (rl *RateLimiter) Allow(ip string) bool {
 
 	now := time.Now()
 
-	if len(rl.clients) >= maxTrackedClients {
-		for k, v := range rl.clients {
-			if now.After(v.windowEnd) {
-				delete(rl.clients, k)
+	if state, exists := rl.clients[ip]; exists {
+		if !now.Before(state.windowEnd) {
+			rl.clients[ip] = clientWindow{
+				count:     1,
+				windowEnd: now.Add(rl.window),
 			}
+			return true
 		}
-	}
-
-	state, exists := rl.clients[ip]
-	if !exists || now.After(state.windowEnd) {
-		rl.clients[ip] = clientWindow{
-			count:     1,
-			windowEnd: now.Add(rl.window),
+		if state.count >= rl.limit {
+			return false
 		}
+		state.count++
+		rl.clients[ip] = state
 		return true
 	}
 
-	if state.count >= rl.limit {
-		return false
+	if len(rl.clients) >= rl.maxClients {
+		rl.evictExpired(now)
+		if len(rl.clients) >= rl.maxClients {
+			return false
+		}
 	}
 
-	state.count++
-	rl.clients[ip] = state
+	rl.clients[ip] = clientWindow{
+		count:     1,
+		windowEnd: now.Add(rl.window),
+	}
 	return true
 }
 
+func (rl *RateLimiter) evictExpired(now time.Time) {
+	for k, v := range rl.clients {
+		if !now.Before(v.windowEnd) {
+			delete(rl.clients, k)
+		}
+	}
+}
+
 func clientIP(remoteAddr string) string {
+	remoteAddr = strings.TrimSpace(remoteAddr)
 	host, _, err := net.SplitHostPort(remoteAddr)
 	if err != nil {
 		return remoteAddr

@@ -2,11 +2,15 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/efronh/go-llm-honeypot/internal/detection"
 	"github.com/efronh/go-llm-honeypot/internal/logger"
@@ -198,5 +202,79 @@ func TestRateLimiting(t *testing.T) {
 
 	if otherIPRec.Code != http.StatusOK {
 		t.Fatalf("other IP request: status = %d, want %d", otherIPRec.Code, http.StatusOK)
+	}
+}
+
+func TestRateLimiterMaxTrackedClientsAndExpiry(t *testing.T) {
+	rl := NewRateLimiter(5, 25*time.Millisecond)
+	rl.maxClients = 3
+
+	for _, ip := range []string{"192.0.2.1", "192.0.2.2", "192.0.2.3"} {
+		if !rl.Allow(ip) {
+			t.Fatalf("expected IP %s to be allowed", ip)
+		}
+	}
+
+	// Table is full (3 active IPs). A 4th distinct IP must be rejected and not added to map.
+	if rl.Allow("192.0.2.4") {
+		t.Fatalf("expected 4th distinct IP to be rejected when maxClients=3 is reached")
+	}
+	if len(rl.clients) != 3 {
+		t.Fatalf("clients map size = %d, want hard cap of 3", len(rl.clients))
+	}
+
+	// Existing tracked IP must still be allowed up to its limit
+	if !rl.Allow("192.0.2.1") {
+		t.Fatalf("expected already-tracked IP 192.0.2.1 to be allowed")
+	}
+
+	// Wait for window to expire, then 4th IP should trigger eviction and be allowed
+	time.Sleep(35 * time.Millisecond)
+	if !rl.Allow("192.0.2.4") {
+		t.Fatalf("expected 192.0.2.4 to be allowed after expired entries are evicted")
+	}
+	if len(rl.clients) != 1 {
+		t.Fatalf("clients map size after eviction = %d, want 1", len(rl.clients))
+	}
+}
+
+func TestRateLimiterConcurrency(t *testing.T) {
+	const limit = 10
+	const maxClients = 20
+	rl := NewRateLimiter(limit, time.Minute)
+	rl.maxClients = maxClients
+
+	var wg sync.WaitGroup
+	var allowedSameIP atomic.Int32
+
+	// 50 concurrent requests from the same IP: exactly 'limit' (10) must be allowed
+	for i := 0; i < 50; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if rl.Allow("198.51.100.1") {
+				allowedSameIP.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := int(allowedSameIP.Load()); got != limit {
+		t.Fatalf("concurrent same-IP allowed = %d, want %d", got, limit)
+	}
+
+	// 100 concurrent requests from distinct IPs: map size must never exceed maxClients (20)
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		ip := fmt.Sprintf("203.0.113.%d", i)
+		go func(client string) {
+			defer wg.Done()
+			rl.Allow(client)
+		}(ip)
+	}
+	wg.Wait()
+
+	if len(rl.clients) > maxClients {
+		t.Fatalf("clients map size = %d, exceeded maxClients = %d", len(rl.clients), maxClients)
 	}
 }
