@@ -340,7 +340,7 @@ func (d *Detector) analyzeRoles(messages []models.Message, addFinding func(strin
 			seenUser = true
 		case "system", "developer":
 			systemCount++
-			if role == "developer" || seenUser || systemCount > 1 {
+			if seenUser || systemCount > 1 {
 				addFinding(CategoryRoleManipulation, SeverityHigh, 0.90, "privileged_role:"+role)
 				continue
 			}
