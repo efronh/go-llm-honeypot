@@ -22,9 +22,10 @@ import (
 )
 
 const (
-	defaultMaxLogSize = 10 << 20 // 10 MB
-	maxScannerBuffer  = 1 << 20  // 1 MB max line size for Summarize
-	minHMACKeyLength  = 16
+	defaultMaxLogSize           = 10 << 20 // 10 MB
+	maxScannerBuffer            = 1 << 20  // 1 MB max line size for Summarize
+	minHMACKeyLength            = 16
+	logFilePerm     os.FileMode = 0o600
 )
 
 type Logger struct {
@@ -45,14 +46,8 @@ func New(path string) (*Logger, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	file, info, err := openSecureLogFile(path)
 	if err != nil {
-		return nil, err
-	}
-
-	info, err := file.Stat()
-	if err != nil {
-		_ = file.Close()
 		return nil, err
 	}
 
@@ -63,6 +58,41 @@ func New(path string) (*Logger, error) {
 		maxSize:     defaultMaxLogSize,
 		currentSize: info.Size(),
 	}, nil
+}
+
+func openSecureLogFile(path string) (*os.File, os.FileInfo, error) {
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, logFilePerm)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, nil, errors.New("log path must be a regular file")
+	}
+
+	if info.Mode().Perm() != logFilePerm {
+		if err := file.Chmod(logFilePerm); err != nil {
+			_ = file.Close()
+			return nil, nil, err
+		}
+		info, err = file.Stat()
+		if err != nil {
+			_ = file.Close()
+			return nil, nil, err
+		}
+		if info.Mode().Perm() != logFilePerm {
+			_ = file.Close()
+			return nil, nil, errors.New("failed to enforce 0600 permissions on log file")
+		}
+	}
+
+	return file, info, nil
 }
 
 func (l *Logger) Write(p []byte) (int, error) {
@@ -88,19 +118,23 @@ func (l *Logger) rotate() error {
 	if err := l.file.Close(); err != nil {
 		return err
 	}
+	l.file = nil
 
 	backupPath := l.path + ".1"
 	_ = os.Remove(backupPath)
 	if err := os.Rename(l.path, backupPath); err != nil {
 		return err
 	}
+	if err := os.Chmod(backupPath, logFilePerm); err != nil {
+		return err
+	}
 
-	file, err := os.OpenFile(l.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	file, info, err := openSecureLogFile(l.path)
 	if err != nil {
 		return err
 	}
 	l.file = file
-	l.currentSize = 0
+	l.currentSize = info.Size()
 	return nil
 }
 

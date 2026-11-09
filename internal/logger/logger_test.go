@@ -183,22 +183,90 @@ func TestLogRotation(t *testing.T) {
 	}
 	defer reqLogger.Close()
 
+	// Weaken permissions before rotation to verify rotate() enforces 0600 on both files
+	if err := os.Chmod(logPath, 0o644); err != nil {
+		t.Fatalf("Chmod() error: %v", err)
+	}
+
 	// Set a small maxSize so the 2nd log entry triggers rotation
 	reqLogger.maxSize = 350
 
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	for i := 0; i < 3; i++ {
-		reqLogger.LogRequest(req, models.ChatCompletionRequest{
+		if err := reqLogger.LogRequest(req, models.ChatCompletionRequest{
 			Model:    "gpt-4o",
 			Messages: []models.Message{{Role: "user", Content: "test message"}},
-		}, []detection.Finding{})
+		}, []detection.Finding{}); err != nil {
+			t.Fatalf("LogRequest() error on iteration %d: %v", i, err)
+		}
 	}
 
-	if _, err := os.Stat(logPath + ".1"); err != nil {
+	backupInfo, err := os.Stat(logPath + ".1")
+	if err != nil {
 		t.Fatalf("expected rotated backup file %s.1 to exist: %v", logPath, err)
 	}
-	if _, err := os.Stat(logPath); err != nil {
+	if got := backupInfo.Mode().Perm(); got != 0o600 {
+		t.Errorf("rotated backup file permissions = %04o, want 0600", got)
+	}
+
+	activeInfo, err := os.Stat(logPath)
+	if err != nil {
 		t.Fatalf("expected active log file %s to exist: %v", logPath, err)
+	}
+	if got := activeInfo.Mode().Perm(); got != 0o600 {
+		t.Errorf("active log file permissions after rotation = %04o, want 0600", got)
+	}
+}
+
+func TestLogFilePermissionsNewAndPreExisting(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// 1. Newly created log file must have 0600 permissions
+	newLogPath := filepath.Join(tempDir, "new_honeypot.log")
+	l1, err := New(newLogPath)
+	if err != nil {
+		t.Fatalf("New(newLogPath) error: %v", err)
+	}
+	_ = l1.Close()
+
+	newInfo, err := os.Stat(newLogPath)
+	if err != nil {
+		t.Fatalf("Stat(newLogPath) error: %v", err)
+	}
+	if got := newInfo.Mode().Perm(); got != 0o600 {
+		t.Errorf("newly created log file permissions = %04o, want 0600", got)
+	}
+
+	// 2. Pre-existing log file with weak permissions (0644) must be tightened to 0600
+	existingLogPath := filepath.Join(tempDir, "existing_honeypot.log")
+	initialContent := "{\"event_id\":\"evt-existing\",\"sensor\":\"api\"}\n"
+	if err := os.WriteFile(existingLogPath, []byte(initialContent), 0o644); err != nil {
+		t.Fatalf("WriteFile(existingLogPath) error: %v", err)
+	}
+	if err := os.Chmod(existingLogPath, 0o644); err != nil {
+		t.Fatalf("Chmod(existingLogPath, 0644) error: %v", err)
+	}
+
+	l2, err := New(existingLogPath)
+	if err != nil {
+		t.Fatalf("New(existingLogPath) error: %v", err)
+	}
+	_ = l2.Close()
+
+	existingInfo, err := os.Stat(existingLogPath)
+	if err != nil {
+		t.Fatalf("Stat(existingLogPath) error: %v", err)
+	}
+	if got := existingInfo.Mode().Perm(); got != 0o600 {
+		t.Errorf("pre-existing log file permissions after New() = %04o, want 0600", got)
+	}
+
+	data, err := os.ReadFile(existingLogPath)
+	if err != nil {
+		t.Fatalf("ReadFile(existingLogPath) error: %v", err)
+	}
+	if string(data) != initialContent {
+		t.Errorf("pre-existing log content was altered: got %q, want %q", string(data), initialContent)
 	}
 }
 
