@@ -12,7 +12,7 @@ A lightweight, zero-dependency LLM API and infrastructure honeypot written in Go
 - **Unified Event Schema (`models.Event`):** Emits structured JSONL telemetry designed to correlate API-layer events (`sensor: "api"`) and Linux infrastructure sensor events (`ssh`, `process`, `network`) in a single timeline.
 - **Keyed Cryptographic Fingerprinting (HMAC-SHA256):** Never stores raw attacker prompts or plaintext `Authorization` bearer tokens on disk. Computes canonical HMAC-SHA256 fingerprints (`evidence_hash`, `auth_token_hash`) to prevent rainbow-table reversal while enabling cross-IP payload correlation.
 - **DoS, Memory & Log-Flooding Protection:**
-  - Localhost-first default binding (`127.0.0.1:8080`), strict HTTP timeouts (`ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout`), `16 KB` header cap, and `64 KB` request body cap (`413 Request Entity Too Large`).
+  - Localhost-first default binding (`127.0.0.1:8080`), strict HTTP timeouts (`ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout`), `16 KB` (`1 << 14`) HTTP header cap, and `1 MB` (`1 << 20` bytes) request body cap on `POST /v1/chat/completions` (`413 Request Entity Too Large`).
   - Per-IP fixed-window rate limiter (`30 req/min`) with a hard cap of `10,000` tracked client IPs (`maxTrackedClients`) and sampled `429` telemetry (1st and every 50th violation per window).
   - Automatic size-bounded log rotation at `10 MB` (`honeypot.log` -> `honeypot.log.1`).
 - **OpSec-Safe CLI Reporting (`-report`):** Aggregates event and finding metrics locally from the JSONL log (up to `1 MB` per line) without exposing a public metrics endpoint.
@@ -25,7 +25,7 @@ A lightweight, zero-dependency LLM API and infrastructure honeypot written in Go
 flowchart LR
     A["Attacker / Scanner"] -->|"GET /v1/models\nPOST /v1/chat/completions"| B["Rate Limiter\n(30/min, 10k IP Cap)"]
     B -->|"429 Too Many Requests\n(Sampled 1:50 Telemetry)"| E["Telemetry Logger\n(HMAC-SHA256 + 10MB Rotation)"]
-    B -->|"Allowed"| C["HTTP Validator\n(64KB Cap, Strict JSON)"]
+    B -->|"Allowed"| C["HTTP Validator\n(1MB Body Cap, Strict JSON)"]
     C -->|"400 / 405 / 413"| E
     C -->|"Valid Request"| D["Detection Engine\n(6 Categories, Base64 & Unicode Norm)"]
     D --> E

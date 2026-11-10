@@ -487,6 +487,47 @@ func TestRejectedRequestTelemetryFailureSeparation(t *testing.T) {
 	}
 }
 
+func TestRequestBodyLimitBoundary(t *testing.T) {
+	mux := newTestMux(t)
+
+	prefix := `{"model":"gpt-4o","messages":[{"role":"user","content":"`
+	suffix := `"}]}`
+	overhead := len(prefix) + len(suffix)
+
+	// 1. Body size == maxRequestBody (1 MB = 1,048,576 bytes) must succeed with 200 OK
+	exactBody := prefix + strings.Repeat("a", maxRequestBody-overhead) + suffix
+	if len(exactBody) != maxRequestBody {
+		t.Fatalf("exactBody length = %d, want %d", len(exactBody), maxRequestBody)
+	}
+	exactReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(exactBody))
+	exactReq.RemoteAddr = "198.51.100.70:5000"
+	exactRec := httptest.NewRecorder()
+	mux.ServeHTTP(exactRec, exactReq)
+	if exactRec.Code != http.StatusOK {
+		t.Errorf("exact 1MB body status = %d, want %d", exactRec.Code, http.StatusOK)
+	}
+
+	// 2. Body size == maxRequestBody + 1 (1,048,577 bytes) must be rejected with 413
+	overBody := prefix + strings.Repeat("a", maxRequestBody-overhead+1) + suffix
+	overReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(overBody))
+	overReq.RemoteAddr = "198.51.100.70:5001"
+	overRec := httptest.NewRecorder()
+	mux.ServeHTTP(overRec, overReq)
+	if overRec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("maxRequestBody+1 status = %d, want %d", overRec.Code, http.StatusRequestEntityTooLarge)
+	}
+
+	// 3. Valid JSON object followed by trailing payload exceeding maxRequestBody must return 413
+	trailingOverBody := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}` + strings.Repeat(" ", maxRequestBody)
+	trailingReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(trailingOverBody))
+	trailingReq.RemoteAddr = "198.51.100.70:5002"
+	trailingRec := httptest.NewRecorder()
+	mux.ServeHTTP(trailingRec, trailingReq)
+	if trailingRec.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("trailing oversized body status = %d, want %d", trailingRec.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
 func TestRejectedRequestsAndRateLimitSamplingTelemetry(t *testing.T) {
 	logPath := filepath.Join(t.TempDir(), "honeypot.log")
 	reqLogger, err := logger.New(logPath)
