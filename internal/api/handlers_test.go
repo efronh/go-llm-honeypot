@@ -344,18 +344,146 @@ func TestHandlerReturns500WhenLoggerFails(t *testing.T) {
 	// Close logger before request to simulate disk/write failure
 	_ = reqLogger.Close()
 
+	handler := NewHandler(detection.NewDetector(), reqLogger)
 	mux := http.NewServeMux()
-	NewHandler(detection.NewDetector(), reqLogger).RegisterRoutes(mux)
+	handler.RegisterRoutes(mux)
 
-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
+	// 1. Valid POST /v1/chat/completions must fail closed with 500
+	chatReq := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(
 		`{"model":"gpt-4o","messages":[{"role":"user","content":"Hello"}]}`,
 	))
-	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
+	chatReq.Header.Set("Content-Type", "application/json")
+	chatRec := httptest.NewRecorder()
+	mux.ServeHTTP(chatRec, chatReq)
+	if chatRec.Code != http.StatusInternalServerError {
+		t.Fatalf("chatCompletions status = %d, want %d when logger fails", chatRec.Code, http.StatusInternalServerError)
+	}
 
-	mux.ServeHTTP(rec, req)
-	if rec.Code != http.StatusInternalServerError {
-		t.Fatalf("status = %d, want %d when logger fails", rec.Code, http.StatusInternalServerError)
+	// 2. Valid GET /v1/models must also fail closed with 500
+	modelsReq := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	modelsRec := httptest.NewRecorder()
+	mux.ServeHTTP(modelsRec, modelsReq)
+	if modelsRec.Code != http.StatusInternalServerError {
+		t.Fatalf("listModels status = %d, want %d when logger fails", modelsRec.Code, http.StatusInternalServerError)
+	}
+
+	if got := handler.TelemetryErrorCount(); got != 2 {
+		t.Errorf("TelemetryErrorCount() = %d, want 2", got)
+	}
+}
+
+func TestRejectedRequestTelemetryFailureSeparation(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "honeypot.log")
+	reqLogger, err := logger.New(logPath)
+	if err != nil {
+		t.Fatalf("initialize logger: %v", err)
+	}
+	// Close logger so every LogRejectedRequest call returns an error
+	_ = reqLogger.Close()
+
+	handler := NewHandler(detection.NewDetector(), reqLogger)
+	mux := http.NewServeMux()
+	handler.RegisterRoutes(mux)
+
+	cases := []struct {
+		name           string
+		method         string
+		path           string
+		body           string
+		remoteAddr     string
+		expectedStatus int
+	}{
+		{
+			name:           "405 on /healthz still rejects with 405 and records telemetry error",
+			method:         http.MethodPost,
+			path:           "/healthz",
+			remoteAddr:     "198.51.100.50:5000",
+			expectedStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name:           "405 on /v1/models still rejects with 405 and records telemetry error",
+			method:         http.MethodPost,
+			path:           "/v1/models",
+			remoteAddr:     "198.51.100.50:5001",
+			expectedStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name:           "405 on /v1/chat/completions still rejects with 405 and records telemetry error",
+			method:         http.MethodGet,
+			path:           "/v1/chat/completions",
+			remoteAddr:     "198.51.100.50:5002",
+			expectedStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name:           "400 malformed JSON still rejects with 400 and records telemetry error",
+			method:         http.MethodPost,
+			path:           "/v1/chat/completions",
+			body:           `{"model":"gpt-4o",`,
+			remoteAddr:     "198.51.100.50:5003",
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "400 multiple JSON values still rejects with 400 and records telemetry error",
+			method:         http.MethodPost,
+			path:           "/v1/chat/completions",
+			body:           `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}{"extra":1}`,
+			remoteAddr:     "198.51.100.50:5004",
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "400 empty messages still rejects with 400 and records telemetry error",
+			method:         http.MethodPost,
+			path:           "/v1/chat/completions",
+			body:           `{"model":"gpt-4o","messages":[]}`,
+			remoteAddr:     "198.51.100.50:5005",
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "413 oversized payload still rejects with 413 and records telemetry error",
+			method:         http.MethodPost,
+			path:           "/v1/chat/completions",
+			body:           `{"model":"gpt-4o","messages":[{"role":"user","content":"` + strings.Repeat("A", maxRequestBody+100) + `"}]}`,
+			remoteAddr:     "198.51.100.50:5006",
+			expectedStatus: http.StatusRequestEntityTooLarge,
+		},
+	}
+
+	var expectedTelemetryErrors uint64
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			req.RemoteAddr = tc.remoteAddr
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req)
+
+			if rec.Code != tc.expectedStatus {
+				t.Errorf("status = %d, want %d", rec.Code, tc.expectedStatus)
+			}
+			expectedTelemetryErrors++
+			if got := handler.TelemetryErrorCount(); got != expectedTelemetryErrors {
+				t.Errorf("TelemetryErrorCount() = %d, want %d", got, expectedTelemetryErrors)
+			}
+		})
+	}
+
+	// Trigger 429 rate-limit rejection from a dedicated IP and verify 429 response + telemetry error count
+	for i := 0; i < defaultRateLimit; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/healthz", nil)
+		req.RemoteAddr = "198.51.100.99:6000"
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		expectedTelemetryErrors++
+	}
+	rateLimitedReq := httptest.NewRequest(http.MethodPost, "/healthz", nil)
+	rateLimitedReq.RemoteAddr = "198.51.100.99:6000"
+	rateLimitedRec := httptest.NewRecorder()
+	mux.ServeHTTP(rateLimitedRec, rateLimitedReq)
+	if rateLimitedRec.Code != http.StatusTooManyRequests {
+		t.Errorf("rate-limited status = %d, want %d", rateLimitedRec.Code, http.StatusTooManyRequests)
+	}
+	expectedTelemetryErrors++
+	if got := handler.TelemetryErrorCount(); got != expectedTelemetryErrors {
+		t.Errorf("TelemetryErrorCount() after 429 = %d, want %d", got, expectedTelemetryErrors)
 	}
 }
 
