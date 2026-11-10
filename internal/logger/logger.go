@@ -32,9 +32,12 @@ type Logger struct {
 	mu          sync.Mutex
 	path        string
 	file        *os.File
+	closed      bool
 	hmacKey     []byte
 	maxSize     int64
 	currentSize int64
+	renameFn    func(oldpath, newpath string) error
+	openFileFn  func(path string) (*os.File, os.FileInfo, error)
 }
 
 func New(path string) (*Logger, error) {
@@ -57,6 +60,8 @@ func New(path string) (*Logger, error) {
 		hmacKey:     hmacKey,
 		maxSize:     defaultMaxLogSize,
 		currentSize: info.Size(),
+		renameFn:    os.Rename,
+		openFileFn:  openSecureLogFile,
 	}, nil
 }
 
@@ -95,12 +100,43 @@ func openSecureLogFile(path string) (*os.File, os.FileInfo, error) {
 	return file, info, nil
 }
 
+func (l *Logger) openFile(path string) (*os.File, os.FileInfo, error) {
+	if l.openFileFn != nil {
+		return l.openFileFn(path)
+	}
+	return openSecureLogFile(path)
+}
+
+func (l *Logger) renameFile(oldpath, newpath string) error {
+	if l.renameFn != nil {
+		return l.renameFn(oldpath, newpath)
+	}
+	return os.Rename(oldpath, newpath)
+}
+
+func (l *Logger) reopen() error {
+	file, info, err := l.openFile(l.path)
+	if err != nil {
+		l.file = nil
+		return err
+	}
+	l.file = file
+	l.currentSize = info.Size()
+	return nil
+}
+
 func (l *Logger) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	if l.file == nil {
+	if l.closed {
 		return 0, errors.New("logger file is closed")
+	}
+
+	if l.file == nil {
+		if err := l.reopen(); err != nil {
+			return 0, err
+		}
 	}
 
 	if l.maxSize > 0 && l.currentSize > 0 && l.currentSize+int64(len(p)) > l.maxSize {
@@ -115,22 +151,32 @@ func (l *Logger) Write(p []byte) (int, error) {
 }
 
 func (l *Logger) rotate() error {
-	if err := l.file.Close(); err != nil {
-		return err
+	if l.file != nil {
+		if err := l.file.Close(); err != nil {
+			return err
+		}
+		l.file = nil
 	}
-	l.file = nil
 
 	backupPath := l.path + ".1"
 	_ = os.Remove(backupPath)
-	if err := os.Rename(l.path, backupPath); err != nil {
+	if err := l.renameFile(l.path, backupPath); err != nil {
+		if reopenErr := l.reopen(); reopenErr != nil {
+			return errors.Join(err, reopenErr)
+		}
 		return err
 	}
 	if err := os.Chmod(backupPath, logFilePerm); err != nil {
+		if reopenErr := l.reopen(); reopenErr != nil {
+			return errors.Join(err, reopenErr)
+		}
 		return err
 	}
 
-	file, info, err := openSecureLogFile(l.path)
+	file, info, err := l.openFile(l.path)
 	if err != nil {
+		_ = l.renameFile(backupPath, l.path)
+		_ = l.reopen()
 		return err
 	}
 	l.file = file
@@ -364,6 +410,7 @@ func loadHMACKey() ([]byte, error) {
 func (l *Logger) Close() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.closed = true
 	if l.file == nil {
 		return nil
 	}

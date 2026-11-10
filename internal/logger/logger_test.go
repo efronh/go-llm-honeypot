@@ -1,6 +1,8 @@
 package logger
 
 import (
+	"encoding/json"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -396,5 +398,205 @@ func TestHashMessagesNoDelimiterCollision(t *testing.T) {
 	})
 	if fpSingleWithNewline == fpTwoMessages {
 		t.Errorf("collision between single message with newline and two messages: %s", fpSingleWithNewline)
+	}
+}
+
+func assertValidJSONLLines(t *testing.T, path string) []models.Event {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error: %v", path, err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	var events []models.Event
+	for i, line := range lines {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var ev models.Event
+		if err := json.Unmarshal([]byte(line), &ev); err != nil {
+			t.Fatalf("corrupted JSONL line %d in %s: %v (line=%q)", i+1, path, err, line)
+		}
+		events = append(events, ev)
+	}
+	return events
+}
+
+func TestLogRotationRenameFailureRecovery(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "honeypot.log")
+
+	reqLogger, err := New(logPath)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer reqLogger.Close()
+
+	reqLogger.maxSize = 150
+
+	// 1. Write initial event before rotation threshold
+	if err := reqLogger.LogEvent(models.Event{
+		EventID:   "evt-before-rename-fail",
+		Sensor:    models.SensorAPI,
+		EventType: "benign_request",
+		Severity:  "info",
+	}); err != nil {
+		t.Fatalf("initial LogEvent() error: %v", err)
+	}
+
+	// 2. Block rename by placing a non-empty directory at backupPath (honeypot.log.1)
+	backupDir := logPath + ".1"
+	if err := os.MkdirAll(filepath.Join(backupDir, "nested"), 0o700); err != nil {
+		t.Fatalf("MkdirAll(backupDir) error: %v", err)
+	}
+
+	// Trigger rotation -> rename must fail, but logger must reopen original file handle
+	if err := reqLogger.LogEvent(models.Event{
+		EventID:   "evt-during-rename-fail",
+		Sensor:    models.SensorAPI,
+		EventType: "benign_request",
+		Severity:  "info",
+	}); err == nil {
+		t.Fatalf("expected error when rename fails due to non-empty backup directory, got nil")
+	}
+
+	if reqLogger.file == nil {
+		t.Fatalf("expected logger to reopen and hold a valid file handle after rename failure, got nil")
+	}
+
+	// Verify original event was not lost or corrupted
+	eventsBeforeRecovery := assertValidJSONLLines(t, logPath)
+	if len(eventsBeforeRecovery) != 1 || eventsBeforeRecovery[0].EventID != "evt-before-rename-fail" {
+		t.Fatalf("unexpected events after rename failure: %+v", eventsBeforeRecovery)
+	}
+
+	// 3. Remove blocking directory and verify subsequent rotation & logging succeed
+	if err := os.RemoveAll(backupDir); err != nil {
+		t.Fatalf("RemoveAll(backupDir) error: %v", err)
+	}
+
+	if err := reqLogger.LogEvent(models.Event{
+		EventID:   "evt-after-rename-recovery",
+		Sensor:    models.SensorAPI,
+		EventType: "prompt_injection",
+		Severity:  detection.SeverityHigh,
+	}); err != nil {
+		t.Fatalf("LogEvent() after rename recovery failed: %v", err)
+	}
+
+	backupEvents := assertValidJSONLLines(t, logPath+".1")
+	activeEvents := assertValidJSONLLines(t, logPath)
+	if len(backupEvents) != 1 || backupEvents[0].EventID != "evt-before-rename-fail" {
+		t.Errorf("backup file events = %+v, want evt-before-rename-fail", backupEvents)
+	}
+	if len(activeEvents) != 1 || activeEvents[0].EventID != "evt-after-rename-recovery" {
+		t.Errorf("active file events = %+v, want evt-after-rename-recovery", activeEvents)
+	}
+}
+
+func TestLogRotationNewFileCreationFailureRecovery(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "honeypot.log")
+
+	reqLogger, err := New(logPath)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer reqLogger.Close()
+
+	reqLogger.maxSize = 150
+
+	if err := reqLogger.LogEvent(models.Event{
+		EventID:   "evt-initial",
+		Sensor:    models.SensorAPI,
+		EventType: "benign_request",
+		Severity:  "info",
+	}); err != nil {
+		t.Fatalf("initial LogEvent() error: %v", err)
+	}
+
+	// Simulate failure when opening the new log file during rotation
+	failOpen := true
+	reqLogger.openFileFn = func(path string) (*os.File, os.FileInfo, error) {
+		if failOpen {
+			return nil, nil, errors.New("simulated new file creation failure")
+		}
+		return openSecureLogFile(path)
+	}
+
+	if err := reqLogger.LogEvent(models.Event{
+		EventID:   "evt-failed-open",
+		Sensor:    models.SensorAPI,
+		EventType: "benign_request",
+		Severity:  "info",
+	}); err == nil {
+		t.Fatalf("expected error when new log file creation fails during rotation, got nil")
+	}
+
+	// Restore openFileFn and verify next LogEvent automatically recovers via reopen() and continues logging
+	failOpen = false
+	if err := reqLogger.LogEvent(models.Event{
+		EventID:   "evt-recovered-after-open-fail",
+		Sensor:    models.SensorAPI,
+		EventType: "prompt_injection",
+		Severity:  detection.SeverityHigh,
+	}); err != nil {
+		t.Fatalf("LogEvent() after new file creation recovery failed: %v", err)
+	}
+
+	if reqLogger.file == nil {
+		t.Fatalf("expected valid open file handle after recovery")
+	}
+
+	activeEvents := assertValidJSONLLines(t, logPath)
+	if len(activeEvents) == 0 {
+		t.Fatalf("expected active log file to contain events after recovery")
+	}
+}
+
+func TestMultipleLogRotationsAndContinuedWriting(t *testing.T) {
+	tempDir := t.TempDir()
+	logPath := filepath.Join(tempDir, "honeypot.log")
+
+	reqLogger, err := New(logPath)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer reqLogger.Close()
+
+	// Set maxSize so every single event triggers a rotation after the 1st event
+	reqLogger.maxSize = 150
+
+	totalWritten := 6
+	for i := 1; i <= totalWritten; i++ {
+		if err := reqLogger.LogEvent(models.Event{
+			EventID:   "evt-multi-" + string(rune('0'+i)),
+			Sensor:    models.SensorAPI,
+			EventType: "prompt_injection",
+			Severity:  detection.SeverityHigh,
+		}); err != nil {
+			t.Fatalf("LogEvent() #%d failed across multiple rotations: %v", i, err)
+		}
+	}
+
+	// Verify both active and backup files have 0600 permissions and valid JSONL lines
+	for _, p := range []string{logPath, logPath + ".1"} {
+		info, err := os.Stat(p)
+		if err != nil {
+			t.Fatalf("Stat(%s) error: %v", p, err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Errorf("%s permissions = %04o, want 0600", p, got)
+		}
+	}
+
+	backupEvents := assertValidJSONLLines(t, logPath+".1")
+	activeEvents := assertValidJSONLLines(t, logPath)
+
+	if len(backupEvents) != 1 || backupEvents[0].EventID != "evt-multi-5" {
+		t.Errorf("backupEvents = %+v, want [evt-multi-5]", backupEvents)
+	}
+	if len(activeEvents) != 1 || activeEvents[0].EventID != "evt-multi-6" {
+		t.Errorf("activeEvents = %+v, want [evt-multi-6]", activeEvents)
 	}
 }
