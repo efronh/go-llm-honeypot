@@ -10,7 +10,7 @@ A lightweight, zero-dependency LLM API and infrastructure honeypot written in Go
 - **6-Category Detection Engine (EN & TR):** Detects adversarial prompts across 6 categories (`prompt_injection`, `system_prompt_extraction`, `jailbreak`, `role_manipulation`, `obfuscation`, `multi_turn_manipulation`) in both English and Turkish, assigning per-finding `severity` and `confidence` (`0.0`–`1.0`) scores.
 - **Obfuscation & Encoding Normalization:** Automatically decodes standard and URL-safe Base64 payloads (including 2-layer nested Base64 chains within strict resource bounds) and normalizes Unicode zero-width/BiDi characters, Fullwidth ASCII, Cyrillic homoglyphs, and character-spaced evasion strings without mutating the original request.
 - **Unified Event Schema (`models.Event`):** Emits structured JSONL telemetry designed to correlate API-layer events (`sensor: "api"`) and Linux infrastructure sensor events (`ssh`, `process`, `network`) in a single timeline.
-- **Keyed Cryptographic Fingerprinting (HMAC-SHA256):** Never stores raw attacker prompts or plaintext `Authorization` bearer tokens on disk. Computes canonical HMAC-SHA256 fingerprints (`evidence_hash`, `auth_token_hash`) to prevent rainbow-table reversal while enabling cross-IP payload correlation.
+- **Keyed Cryptographic Fingerprinting (HMAC-SHA256):** Never stores raw attacker prompts or plaintext `Authorization` bearer tokens on disk. Computes canonical HMAC-SHA256 fingerprints (`evidence_hash`, `prompt_hmac_sha256`, `auth_hmac_sha256`) to prevent rainbow-table reversal while enabling cross-IP payload correlation.
 - **DoS, Memory & Log-Flooding Protection:**
   - Localhost-first default binding (`127.0.0.1:8080`), strict HTTP timeouts (`ReadHeaderTimeout`, `ReadTimeout`, `WriteTimeout`, `IdleTimeout`), `16 KB` (`1 << 14`) HTTP header cap, and `1 MB` (`1 << 20` bytes) request body cap on `POST /v1/chat/completions` (`413 Request Entity Too Large`).
   - Per-IP fixed-window rate limiter (`30 req/min`) with a hard cap of `10,000` tracked client IPs (`maxTrackedClients`) and sampled `429` telemetry (1st and every 50th violation per window).
@@ -121,10 +121,10 @@ If writing an event to `logs/honeypot.log` fails (e.g., disk full or file descri
 | :--- | :--- | :--- |
 | `HOST` | `127.0.0.1` | Bind address (`127.0.0.1` for local/reverse-proxy use, `0.0.0.0` inside isolated VM/container). |
 | `PORT` | `8080` | HTTP listening port. |
-| `LOG_FILE` | `logs/honeypot.log` | Path to the JSONL telemetry file (created with `0600` permissions, rotates at `10 MB`). |
+| `LOG_FILE` | `logs/honeypot.log` | Path to the JSONL telemetry file (enforces `0600` permissions, rotates at `10 MB`). |
 | `HMAC_KEY_FILE` | *(unset)* | Path to a `0600`/`0400` secret key file (>= 16 bytes) used for HMAC-SHA256 fingerprinting. |
 | `HMAC_KEY` | *(unset)* | Environment fallback secret (>= 16 bytes) if `HMAC_KEY_FILE` is not used. |
-| `REQUIRE_HMAC_KEY` | `false` | When `true` or `1`, refuses to start unless `HMAC_KEY_FILE` or `HMAC_KEY` is provided. |
+| `REQUIRE_HMAC_KEY` | `false` | When `true`, refuses to start unless `HMAC_KEY_FILE` or `HMAC_KEY` is provided. |
 
 ### 2. Run the Honeypot Server
 
@@ -154,30 +154,23 @@ curl -s -X POST http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-### 4. Sample Unified Telemetry Event (`logs/honeypot.log`)
+### 4. Sample Unified Telemetry Events (`logs/honeypot.log`)
 
+**Adversarial Chat Completion Event (`LogRequest`):**
 ```json
 {
-  "event_id": "a9c2f0c41d8e7b12f3a109e4c5d67890",
-  "timestamp": "2026-11-09T08:30:12.418291+03:00",
+  "event_id": "evt-a9c2f0c41d8e7b12",
+  "timestamp": "2026-11-10T13:50:12.418291Z",
   "sensor": "api",
   "source_ip": "127.0.0.1",
-  "event_type": "llm_prompt_attack",
+  "event_type": "role_manipulation",
   "severity": "high",
-  "confidence": 0.95,
+  "confidence": 0.9,
   "target": "/v1/chat/completions",
   "evidence_hash": "8f3c91d42b6a0e19c7d84f2a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c",
   "metadata": {
-    "method": "POST",
-    "path": "/v1/chat/completions",
-    "remote_addr": "127.0.0.1:54321",
-    "user_agent": "curl/8.7.1",
-    "has_auth_header": true,
-    "auth_token_hash": "4b2e8a91c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0",
-    "model": "gpt-4o",
-    "message_count": 2,
-    "status_code": 200,
-    "is_suspicious": true,
+    "auth_hmac_sha256": "4b2e8a91c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0",
+    "auth_scheme": "bearer",
     "findings": [
       {
         "category": "role_manipulation",
@@ -197,7 +190,42 @@ curl -s -X POST http://127.0.0.1:8080/v1/chat/completions \
         "confidence": 0.95,
         "indicator": "reveal the system prompt"
       }
-    ]
+    ],
+    "has_auth_header": true,
+    "is_suspicious": true,
+    "message_count": 2,
+    "method": "POST",
+    "model": "gpt-4o",
+    "prompt_hmac_sha256": "8f3c91d42b6a0e19c7d84f2a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c",
+    "source_port": "54321",
+    "user_agent": "curl/8.7.1"
+  }
+}
+```
+
+**Rejected Request Event (`LogRejectedRequest`, e.g., `429 Too Many Requests`):**
+```json
+{
+  "event_id": "evt-7f1e3b5c9a0d2e44",
+  "timestamp": "2026-11-10T13:50:15.102938Z",
+  "sensor": "api",
+  "source_ip": "127.0.0.1",
+  "event_type": "rate_limit_exceeded",
+  "severity": "medium",
+  "confidence": 1,
+  "target": "/v1/chat/completions",
+  "evidence_hash": "4b2e8a91c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0",
+  "metadata": {
+    "auth_hmac_sha256": "4b2e8a91c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0",
+    "auth_scheme": "bearer",
+    "has_auth_header": true,
+    "is_suspicious": true,
+    "method": "POST",
+    "reason": "rate limit exceeded",
+    "source_port": "54355",
+    "status_code": 429,
+    "user_agent": "curl/8.7.1",
+    "violation_count": 1
   }
 }
 ```
@@ -211,15 +239,26 @@ go run ./cmd/server -report
 ```json
 {
   "total_events": 4,
-  "suspicious_events": 3,
+  "suspicious_events": 2,
+  "total_requests": 4,
+  "suspicious_requests": 2,
   "by_sensor": {
     "api": 4
   },
   "by_event_type": {
-    "api_models_recon": 1,
-    "http_bad_request": 1,
-    "http_rate_limit_exceeded": 1,
-    "llm_prompt_attack": 1
+    "api_recon": 1,
+    "malformed_json": 1,
+    "rate_limit_exceeded": 1,
+    "role_manipulation": 1
+  },
+  "by_event_severity": {
+    "high": 1,
+    "info": 1,
+    "low": 1,
+    "medium": 1
+  },
+  "by_finding_severity": {
+    "high": 3
   },
   "by_path": {
     "/v1/chat/completions": 3,
@@ -233,14 +272,11 @@ go run ./cmd/server -report
     "role_manipulation": 1,
     "system_prompt_extraction": 1
   },
-  "by_event_severity": {
+  "by_severity": {
     "high": 1,
     "info": 1,
     "low": 1,
     "medium": 1
-  },
-  "by_finding_severity": {
-    "high": 3
   }
 }
 ```
